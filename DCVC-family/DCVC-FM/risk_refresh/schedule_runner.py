@@ -261,6 +261,14 @@ def run_schedule(args):
 
     i_net, p_net = init_models(args, device)
 
+    policy_mod = None
+    if getattr(args, "policy_py", None):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("policy_mod", args.policy_py)
+        policy_mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(policy_mod)
+        print(f"[policy] loaded {args.policy_py}, budget={args.policy_budget}")
+
     resume_meta = None
     if args.resume_snapshot:
         # ── P1 分支模式 ──
@@ -328,9 +336,33 @@ def run_schedule(args):
 
     with torch.no_grad():
         # ─── 编码循环 ───
+        prev_x = None
         for t in range(start_idx, frame_num):
             act = actions[t]
             mode, q = act["mode"], act["q_index"]
+            x, y, u, v = read_src_frame(src_reader, device, args.float16)
+            x_cur = x
+
+            # P3: 在线策略 (仅完整模式且未指定分支计划时生效)
+            if (policy_mod is not None and resume_meta is None
+                    and t > 0 and mode == "P"
+                    and trajectory["reset_count"] < args.policy_budget):
+                fd = 0.0 if prev_x is None else float(
+                    (x_cur[0, 0] - prev_x[0, 0]).abs().mean().item()) * 255.0
+                feat = {
+                    "frame_idx": t, "q_index": q,
+                    "ref_age": t - trajectory["last_refresh"],
+                    "n_resets_used": trajectory["reset_count"],
+                    "budget_remaining": args.policy_budget - trajectory["reset_count"],
+                    "budget_total": args.policy_budget,
+                    "bits_last8": [r["actual_total_bits"] for r in rows[-8:]],
+                    "psnry_last8": [r["psnr_y"] for r in rows[-8:]],
+                    "frame_diff": fd,
+                }
+                if policy_mod.decide(feat) == "P_RESET":
+                    mode = "P_RESET"
+                    if args.verbose >= 2:
+                        print(f"[policy] P_RESET @ frame {t}")
 
             # pre-frame t 快照(执行动作前)
             if t in snap_frames and args.snapshot_dir:
@@ -345,7 +377,6 @@ def run_schedule(args):
                     print(f"snapshot saved: pre_frame_{t:04d}")
 
             frame_start = time.time()
-            x, y, u, v = read_src_frame(src_reader, device, args.float16)
             x_padded = F.pad(x, (padding_l, padding_r, padding_t, padding_b), mode="replicate")
 
             if mode == "I":
@@ -413,6 +444,7 @@ def run_schedule(args):
             })
             outstanding_sps_bytes = 0
             trajectory.update(last_q=q, last_fa=fa_idx)
+            prev_x = x_cur
 
             if args.verbose >= 2:
                 print(f"frame {t} encoded, {enc_ms/1000:.3f} s, bits: {rows[-1]['actual_total_bits']}, "
@@ -557,6 +589,8 @@ def parse_args():
     ap.add_argument("--snapshot_dir", default=None)
     ap.add_argument("--snapshot_frames", type=int, nargs="+", default=None,
                     help="save pre-frame snapshot before executing these frames")
+    ap.add_argument("--policy_py", default=None, help="P3: policy module path")
+    ap.add_argument("--policy_budget", type=int, default=4)
     return ap.parse_args()
 
 

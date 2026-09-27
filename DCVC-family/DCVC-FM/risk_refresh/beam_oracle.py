@@ -1,16 +1,23 @@
 #!/usr/bin/env python3
 """
-beam_oracle.py — P1.4/P1.5 预算约束 beam-search oracle (协议 §8/§9)
+beam_oracle.py — P1.4/P1.5 预算约束 beam-search oracle (协议 §8/§9) + P1-R2 protected incumbent
 有限动作、预算约束的 beam oracle —— 非全局最优, 名称纪律见协议 §9.1。
 
 机制: 15 段 x 8 帧决策网格; 每节点携带完整编码状态 (DPB/SPS/码流前缀/累计量);
-扩展=真实编码 8 帧段 (BytesIO 码流); 剪枝=硬约束过滤 -> Pareto -> surrogate 截断;
+扩展=真实编码 8 帧段 (BytesIO 码流); 剪枝=硬约束过滤 -> Pareto -> 分层截断;
 frontier 轨迹 100% 完整解码审计 (协议 11.2)。
+
+P1-R2 (2026-09-24, 评审要求):
+  --incumbent_schedule <grid_baseline.json>  网格兼容固定基线 (非P动作必须在8的倍数帧)
+  --protect_incumbent  每 depth 强制保留 incumbent 前缀 (挤占一个束位)
+  incumbent 预编码 + 全约束自检 (bits/peak/计数/spacing), 违规即中止并列出违规项;
+  终局输出 incumbent 独立行; frontier 最优劣于 incumbent -> ENGINE FAILURE (该次运行 invalid)。
 
 用法:
   python3 -m risk_refresh.beam_oracle --sequence_id ... --src_path ... \
     --q_init 0 --oracle resetonly --budget_bits N --peak_budget_bits M \
-    --beam_width 8 --out_dir ... [--n_i_max 1] [--n_reset_max 4] [--i_spacing 16]
+    --beam_width 8 --out_dir ... [--n_i_max 1] [--n_reset_max 4] [--i_spacing 16] \
+    [--incumbent_schedule B1grid.json] [--protect_incumbent]
 """
 
 import argparse
@@ -35,6 +42,7 @@ from src.utils.metrics import calc_psnr
 
 from risk_refresh.schedule_runner import (
     init_models, calc_distortion, recon_hash, INDEX_MAP, sha256_file)
+from risk_refresh.schedule_io import validate as validate_schedule
 
 SEG_LEN = 8
 FRAME_NUM = 120
@@ -55,16 +63,11 @@ def load_frames(src_path, width, height, frame_num):
     return np.stack(ys), np.stack(uvs)
 
 
-def frame_to_tensor(frames, t, device):
-    x = torch.from_numpy(frames[t].astype(np.float32) / 255.0)
-    # 转 444 (与 runner 一致: ycbcr420_to_444 期望 y,uv 分离格式, 这里简化按 runner 流程)
-    return x  # 占位, 实际在 encode_segment 内走完整转换
-
-
 # ────────────────── 段编码 ──────────────────
 
 def encode_segment(i_net, p_net, dpb_in, spss_in, ys_np, uvs_np, t0, mode, q,
-                   device, padding, src_width, src_height):
+                   device, padding, src_width, src_height,
+                   seg_len=SEG_LEN):
     """编码 [t0, t0+8) 段: 首帧按 mode, 其余普通 P(q)。
     返回 (seg_bytes, frame_logs, dpb_out, spss_out)。"""
     buf = io.BytesIO()
@@ -76,9 +79,8 @@ def encode_segment(i_net, p_net, dpb_in, spss_in, ys_np, uvs_np, t0, mode, q,
     pl, pr, pt, pb = padding
 
     with torch.no_grad():
-        for k in range(SEG_LEN):
+        for k in range(seg_len):
             t = t0 + k
-            # yuv420 -> 444 tensor (与 runner.read_src_frame 相同流程)
             yuv = ycbcr420_to_444(ys_np[t], uvs_np[t])
             x = torch.from_numpy(yuv).type(torch.FloatTensor).unsqueeze(0).to(device)
             x_pad = F.pad(x, (pl, pr, pt, pb), mode="replicate")
@@ -115,7 +117,6 @@ def encode_segment(i_net, p_net, dpb_in, spss_in, ys_np, uvs_np, t0, mode, q,
             y_true, uv_true = ys_np[t], uvs_np[t]
             yuv_rec = x_hat.squeeze(0).cpu().numpy()
             y_rec, uv_rec = ycbcr444_to_420(yuv_rec)
-            # 原生 SSE (float64) + PSNR
             psnr_y = calc_psnr(y_true[0], y_rec[0], data_range=1)
             psnr_u = calc_psnr(uv_true[0], uv_rec[0], data_range=1)
             psnr_v = calc_psnr(uv_true[1], uv_rec[1], data_range=1)
@@ -131,6 +132,113 @@ def encode_segment(i_net, p_net, dpb_in, spss_in, ys_np, uvs_np, t0, mode, q,
             outstanding = 0
 
     return buf.getvalue(), logs, dpb, helper.spss
+
+
+# ────────────────── P1-R2: protected incumbent ──────────────────
+
+def parse_grid(spec):
+    """'8:8-56,1:56-77,8:80-120' -> (decisions 升序列表, {t: seg_len})。
+    区域须无缝铺满 [SEG_LEN, FRAME_NUM); 首决策点必须 == SEG_LEN (seed 恒 8 帧)。"""
+    dec = set()
+    for zone in spec.split(","):
+        step_s, rng = zone.split(":")
+        lo, hi = (int(x) for x in rng.split("-"))
+        t = lo
+        while t < hi:
+            dec.add(t)
+            t += int(step_s)
+    decisions = sorted(dec)
+    assert decisions and decisions[0] == SEG_LEN, "grid: first decision must be frame 8"
+    assert decisions[-1] < FRAME_NUM
+    lens = {}
+    for i, t in enumerate(decisions):
+        end = decisions[i + 1] if i + 1 < len(decisions) else FRAME_NUM
+        lens[t] = end - t
+    return decisions, lens
+
+
+def encode_incumbent(args, i_net, p_net, ys_np, uvs_np, device,
+                     budget, peak_budget, padding, decisions, lens):
+    """预编码网格兼容 incumbent。
+    返回 (seed_node, plan, violations):
+      seed_node — 段0 (I+7P) 之后的前缀节点, beam 从 t=8 起扩展它;
+      plan      — {t0: (mode, q)} incumbent 在每个决策段的动作;
+      violations 非空 -> 基线在 oracle 约束下不可行, 调用方必须中止。
+    自检项: 网格兼容性 (非P动作仅在8倍数帧, 段内q一致), bits 总预算,
+            rolling-32 峰值, N_I/N_reset 计数, I 帧间隔。
+    """
+    with open(args.incumbent_schedule, encoding="utf-8") as f:
+        sch = json.load(f)
+    table = validate_schedule(sch)
+    violations = []
+
+    dec_set = set(decisions)
+    for t in range(1, FRAME_NUM):
+        if table[t]["mode"] != "P" and t not in dec_set:
+            violations.append(f"grid: non-P action at frame {t} not a decision point")
+    plan = {}
+    for t0 in decisions:
+        qs = {table[t0 + k]["q_index"] for k in range(lens[t0])}
+        if len(qs) != 1:
+            violations.append(f"grid: segment {t0} mixed q {sorted(qs)}")
+        plan[t0] = (table[t0]["mode"], table[t0]["q_index"])
+    if table[0]["mode"] != "I":
+        violations.append("grid: frame 0 must be I")
+    elif table[0]["q_index"] != args.q_init:
+        violations.append(
+            f"grid: segment0 q={table[0]['q_index']} != q_init={args.q_init}")
+    if violations:
+        return None, None, violations
+
+    pl, pr, pt, pb = padding
+    dpb = {"ref_frame": None, "ref_feature": None, "ref_mv_feature": None,
+           "ref_y": None, "ref_mv_y": None}
+    spss = []
+    logs, cum = [], 0
+    n_i = n_reset = last_i = 0
+    seed_node = None
+    for t0, sl in [(0, SEG_LEN)] + [(t, lens[t]) for t in decisions]:
+        m = table[t0]["mode"]
+        q = table[t0]["q_index"]
+        sb, lg, dpb, spss = encode_segment(i_net, p_net, dpb, spss, ys_np, uvs_np,
+                                           t0, m, q, device, (pl, pr, pt, pb),
+                                           args.width, args.height, seg_len=sl)
+        logs.extend(lg)
+        cum += sum(l["bits"] for l in lg)
+        if t0 == 0:
+            seed_node = Node(
+                dpb=dpb, spss=spss,
+                cum_bits=sum(l["bits"] for l in lg),
+                cum_sse_y=sum(l["sse_y"] for l in lg),
+                cum_sse_yuv=sum(6 * l["sse_y"] + l["sse_u"] + l["sse_v"] for l in lg) / 8,
+                win_q=deque([l["bits"] for l in lg], maxlen=32),
+                n_i=1, n_reset=0, last_i=0, last_refresh=0,
+                hist=[(0, "I", args.q_init)], chunks=[sb], logs=list(lg))
+        if m == "I":
+            if t0 > 0 and t0 - last_i < args.i_spacing:
+                violations.append(f"spacing: I at {t0} < {args.i_spacing} from {last_i}")
+            n_i += 1
+            last_i = t0
+        if m == "P_RESET":
+            n_reset += 1
+
+    if cum > budget * (1 + EPS):
+        violations.append(f"budget: incumbent {cum} > cap {int(budget * (1 + EPS))}")
+    wq, peak = [], 0
+    for l in logs:
+        wq.append(l["bits"])
+        if len(wq) > 32:
+            wq.pop(0)
+        peak = max(peak, sum(wq))
+    if peak > peak_budget * (1 + EPS):
+        violations.append(f"peak: incumbent {peak} > cap {int(peak_budget * (1 + EPS))}")
+    if n_i > args.n_i_max:
+        violations.append(f"count: N_I {n_i} (incl initial) > {args.n_i_max}")
+    if n_reset > args.n_reset_max:
+        violations.append(f"count: N_reset {n_reset} > {args.n_reset_max}")
+    if violations:
+        return None, None, violations
+    return seed_node, plan, []
 
 
 # ────────────────── beam 搜索 ──────────────────
@@ -156,7 +264,6 @@ def make_candidates(oracle, q_cand, t, node, args):
             cands.append(("P", q))
             if (t - node.last_i >= args.i_spacing) and (node.n_i < args.n_i_max):
                 cands.append(("I", q))
-    # 去重
     seen, out = set(), []
     for c in cands:
         if c not in seen:
@@ -173,10 +280,10 @@ def dominated(a, b):
 
 def beam_search(args, i_net, p_net, ys_np, uvs_np, device, budget, peak_budget):
     pl, pr, pt, pb = args.padding
-    depths = list(range(SEG_LEN, FRAME_NUM, SEG_LEN))  # 8,16,...,112
+    depths, lens = parse_grid(getattr(args, "decision_grid", "8:8-120"))
+    assert all(lens[t] >= 1 for t in depths)
     q_cand = sorted({args.q_init, 0 if args.q_init != 0 else 21})
 
-    # 根节点: t=0 段 (I + 7P) @ q_init
     seed_bytes, seed_logs, dpb0, spss0 = encode_segment(
         i_net, p_net, {"ref_frame": None, "ref_feature": None, "ref_mv_feature": None,
                        "ref_y": None, "ref_mv_y": None}, [], ys_np, uvs_np, 0, "I",
@@ -188,11 +295,26 @@ def beam_search(args, i_net, p_net, ys_np, uvs_np, device, budget, peak_budget):
                 win_q=deque([l["bits"] for l in seed_logs], maxlen=32),
                 n_i=1, n_reset=0, last_i=0, last_refresh=0,
                 hist=[(0, "I", args.q_init)], chunks=[seed_bytes], logs=list(seed_logs))
+
+    # P1-R2: incumbent 预编码 + 约束自检
+    inc_node = None
+    inc_plan = None
+    if args.incumbent_schedule:
+        inc_node, inc_plan, inc_errs = encode_incumbent(
+            args, i_net, p_net, ys_np, uvs_np, device, budget, peak_budget,
+            (pl, pr, pt, pb), depths, lens)
+        if inc_errs:
+            raise SystemExit("incumbent infeasible under oracle constraints:\n  - "
+                             + "\n  - ".join(inc_errs))
+        print("incumbent pre-encoded & feasible (protected)")
+
     beam = [root]
     prune_log = {"budget_violation": 0, "peak_violation": 0, "count_violation": 0,
-                 "dominated": 0, "beam_limit": 0}
+                 "dominated": 0, "beam_limit": 0,
+                 "incumbent_survived": 0, "incumbent_rescued": 0}
 
     for t in depths:
+        sl = lens[t]
         expanded = []
         for node in beam:
             for mode, q in make_candidates(args.oracle, q_cand, t, node, args):
@@ -205,7 +327,8 @@ def beam_search(args, i_net, p_net, ys_np, uvs_np, device, budget, peak_budget):
                 try:
                     seg_bytes, logs, dpb, spss = encode_segment(
                         i_net, p_net, node.dpb, node.spss, ys_np, uvs_np, t, mode, q,
-                        device, (pl, pr, pt, pb), args.width, args.height)
+                        device, (pl, pr, pt, pb), args.width, args.height,
+                        seg_len=sl)
                 except AssertionError:
                     prune_log["budget_violation"] += 1
                     continue
@@ -236,6 +359,33 @@ def beam_search(args, i_net, p_net, ys_np, uvs_np, device, budget, peak_budget):
                     hist=node.hist + [(t, mode, q)],
                     chunks=node.chunks + [seg_bytes],
                     logs=node.logs + logs))
+
+        # P1-R2: incumbent 独立扩展 (前置自检已通过, 其前缀天然满足累计约束)
+        inc_child = None
+        if inc_node is not None:
+            m, q = inc_plan[t]
+            sb, lg, dpb, spss = encode_segment(
+                i_net, p_net, inc_node.dpb, inc_node.spss, ys_np, uvs_np,
+                t, m, q, device, (pl, pr, pt, pb), args.width, args.height,
+                seg_len=sl)
+            wq = deque(inc_node.win_q, maxlen=32)
+            for l in lg:
+                wq.append(l["bits"])
+            inc_child = Node(
+                dpb=dpb, spss=spss,
+                cum_bits=inc_node.cum_bits + sum(l["bits"] for l in lg),
+                cum_sse_y=inc_node.cum_sse_y + sum(l["sse_y"] for l in lg),
+                cum_sse_yuv=inc_node.cum_sse_yuv
+                + sum(6 * l["sse_y"] + l["sse_u"] + l["sse_v"] for l in lg) / 8,
+                win_q=wq,
+                n_i=inc_node.n_i + (1 if m == "I" else 0),
+                n_reset=inc_node.n_reset + (1 if m == "P_RESET" else 0),
+                last_i=t if m == "I" else inc_node.last_i,
+                last_refresh=t if m == "P_RESET" else inc_node.last_refresh,
+                hist=inc_node.hist + [(t, m, q)],
+                chunks=inc_node.chunks + [sb],
+                logs=inc_node.logs + lg)
+
         # Pareto 过滤
         survivors = []
         for a in expanded:
@@ -243,9 +393,8 @@ def beam_search(args, i_net, p_net, ys_np, uvs_np, device, budget, peak_budget):
                 prune_log["dominated"] += 1
             else:
                 survivors.append(a)
-        # 宽度截断 (预注册 surrogate: 归一化 sse + bits)
+        # 宽度截断: 分层采样 (按 cum_bits 均匀取点, 保留两端)
         if len(survivors) > args.beam_width:
-            # 分层采样: 按 cum_bits 排序后均匀取点, 始终保留最省bits与最低sse两端
             survivors.sort(key=lambda n: n.cum_bits)
             k = args.beam_width
             idxs = sorted({round(i * (len(survivors) - 1) / max(k - 1, 1))
@@ -253,6 +402,19 @@ def beam_search(args, i_net, p_net, ys_np, uvs_np, device, budget, peak_budget):
             picked = [survivors[i] for i in idxs][:k]
             prune_log["beam_limit"] += len(survivors) - len(picked)
             survivors = picked
+        # P1-R2: incumbent 保护 (存活检查 / 强制插回挤占束位)
+        if inc_child is not None:
+            alive = any(x.cum_bits == inc_child.cum_bits and x.hist == inc_child.hist
+                        for x in survivors)
+            if alive:
+                prune_log["incumbent_survived"] += 1
+            else:
+                if len(survivors) >= args.beam_width:
+                    survivors = survivors[:-1] + [inc_child]
+                else:
+                    survivors = survivors + [inc_child]
+                prune_log["incumbent_rescued"] += 1
+            inc_node = inc_child
         beam = survivors
         if not beam:
             raise SystemExit(f"beam 在 t={t} 处清空 —— 预算/约束过严, 检查 budget 参数")
@@ -260,9 +422,8 @@ def beam_search(args, i_net, p_net, ys_np, uvs_np, device, budget, peak_budget):
               f"bits=[{min(n.cum_bits for n in beam)}..{max(n.cum_bits for n in beam)}] "
               f"prune={prune_log}")
 
-    # frontier = 终末 survivors 的 Pareto 集
     frontier = [a for a in beam if not any(dominated(a, b) for b in beam if b is not a)]
-    return frontier, prune_log
+    return frontier, prune_log, (inc_node if args.incumbent_schedule else None)
 
 
 # ────────────────── 解码审计 ──────────────────
@@ -284,12 +445,9 @@ def verify_trajectory(node, args, i_net, p_net, ys_np, uvs_np, device, out_bin):
             if header["nal_type"] == NalType.NAL_Ps:
                 pending = header["sps_ids"]
                 sps_id = pending[0]
-                bio_unread = pending[1:]
             else:
                 sps_id = header["sps_id"]
-                bio_unread = []
             sps = helper.get_sps_by_id(sps_id)
-            # 逐帧读取 (NAL_Ps 打包路径罕见, stream_part=1 时逐帧 NAL_I/NAL_P)
             assert header["nal_type"] in (NalType.NAL_I, NalType.NAL_P)
             bit_stream = read_ip_remaining(bio)
             yuv = ycbcr420_to_444(ys_np[idx], uvs_np[idx])
@@ -324,7 +482,7 @@ def main():
     ap.add_argument("--sequence_id", required=True)
     ap.add_argument("--src_path", required=True)
     ap.add_argument("--width", type=int, default=1920)
-    ap.add_argument("--height", type=int, default=1080)
+    ap.add_argument("--height", type=int, default=1920 // 1080 * 1080 or 1080)
     ap.add_argument("--q_init", type=int, required=True)
     ap.add_argument("--oracle", required=True, choices=["qonly", "resetonly", "ionly", "joint"])
     ap.add_argument("--budget_bits", type=int, required=True)
@@ -339,10 +497,15 @@ def main():
     ap.add_argument("--float16", action="store_true")
     ap.add_argument("--budget_floor_seg", type=int, default=0,
                     help="单段 bits 乐观下界, 默认 budget/15")
+    ap.add_argument("--incumbent_schedule", default=None,
+                    help="P1-R2: grid-compatible fixed baseline schedule JSON")
+    ap.add_argument("--protect_incumbent", action="store_true",
+                    help="P1-R2: force-keep incumbent prefix in beam every depth")
+    ap.add_argument("--decision_grid", default="8:8-120",
+                    help="P1-R4: e.g. '8:8-56,1:56-77,8:80-120' (event zone per-frame)")
     args = ap.parse_args()
     args.padding = (0, (args.width + 15) // 16 * 16 - args.width,
                     0, (args.height + 15) // 16 * 16 - args.height)
-    # padding 与 stream_helper.get_padding_size(p=16) 对齐 (左/上为 0)
     from src.utils.stream_helper import get_padding_size
     args.padding = get_padding_size(args.height, args.width, 16)
     if args.budget_floor_seg == 0:
@@ -357,8 +520,9 @@ def main():
     ys_np, uvs_np = load_frames(args.src_path, args.width, args.height, FRAME_NUM)
 
     t0 = time.time()
-    frontier, prune_log = beam_search(args, i_net, p_net, ys_np, uvs_np, device,
-                                      args.budget_bits, args.peak_budget_bits)
+    frontier, prune_log, inc_final = beam_search(
+        args, i_net, p_net, ys_np, uvs_np, device,
+        args.budget_bits, args.peak_budget_bits)
     search_s = time.time() - t0
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -384,15 +548,55 @@ def main():
         with open(os.path.join(args.out_dir, f"{tag}_prune_log.json"), "w") as f:
             json.dump(prune_log, f, indent=1)
 
+    # P1-R2: incumbent 独立行 + ENGINE FAILURE 判定
+    engine_failure = False
+    if inc_final is not None:
+        tag = f"INCUMBENT_{args.oracle}_{args.sequence_id}_q{args.q_init}"
+        out_bin = os.path.join(args.out_dir, f"{tag}.bin")
+        digest = verify_trajectory(inc_final, args, i_net, p_net, ys_np, uvs_np,
+                                   device, out_bin)
+        rows.append({
+            "trajectory_id": tag, "oracle": args.oracle + "_INCUMBENT",
+            "sequence_id": args.sequence_id, "q_init": args.q_init,
+            "beam_width": args.beam_width,
+            "actual_bits": inc_final.cum_bits, "budget_bits": args.budget_bits,
+            "within_budget": inc_final.cum_bits <= args.budget_bits * (1 + EPS),
+            "y_sse": inc_final.cum_sse_y, "yuv_sse_weighted": inc_final.cum_sse_yuv,
+            "n_i": inc_final.n_i, "n_reset": inc_final.n_reset,
+            "i_positions": [t for t, m, _ in inc_final.hist if m == "I"],
+            "reset_positions": [t for t, m, _ in inc_final.hist if m == "P_RESET"],
+            "q_path": [q for _, _, q in inc_final.hist],
+            "decode_verified": True, "bin_sha256": digest,
+            "wall_seconds": round(search_s, 1),
+        })
+        best_oracle = min((r["y_sse"] for r in rows
+                           if "INCUMBENT" not in r["oracle"]
+                           and r["actual_bits"] <= args.budget_bits * (1 + EPS)),
+                          default=None)
+        if best_oracle is not None and best_oracle > inc_final.cum_sse_y:
+            engine_failure = True
+            print(f"ENGINE FAILURE: oracle best {best_oracle:.1f} worse than "
+                  f"incumbent {inc_final.cum_sse_y:.1f} -- run marked INVALID")
+        else:
+            print(f"incumbent check OK: oracle best {best_oracle:.1f} "
+                  f"<= incumbent {inc_final.cum_sse_y:.1f}")
+
     out_csv = os.path.join(args.out_dir,
                            f"frontier_{args.oracle}_{args.sequence_id}_q{args.q_init}_b{args.beam_width}.csv")
     with open(out_csv, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
         w.writeheader()
         w.writerows(rows)
-    print(f"frontier: {len(frontier)} trajectories, all decode-verified")
-    print(f"best: bits={min(r['actual_bits'] for r in rows)} "
-          f"y_sse={min(r['y_sse'] for r in rows):.1f}")
+    print(f"frontier: {len(frontier)} trajectories (+1 incumbent), all decode-verified")
+    within = sorted([r for r in rows if "INCUMBENT" not in r["oracle"]
+                     and r["actual_bits"] <= args.budget_bits * (1 + EPS)],
+                    key=lambda r: r["y_sse"])
+    print("top-3 within budget (by y_sse):")
+    for r in within[:3]:
+        print(f"  bits={r['actual_bits']} y_sse={r['y_sse']:.1f} "
+              f"resets={r['reset_positions']}")
+    if engine_failure:
+        print("STATUS: INVALID (engine failure)")
     print(f"saved: {out_csv}")
 
 
